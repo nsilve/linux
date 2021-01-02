@@ -814,3 +814,75 @@ void bond_prepare_sysfs_group(struct bonding *bond)
 	bond->dev->sysfs_groups[0] = &bonding_group;
 }
 
+static ssize_t bonding_show_weights(struct device *d, struct device_attribute *attr, char *buf)
+{
+	struct slave *slave;
+    int i;
+    struct bonding *bond = to_bond(d);
+
+    read_lock(&bond->lock);
+    bond_for_each_slave(bond, slave, i) {
+    	pr_info("slave #%d: %s\n", i, slave->dev->name);
+        if (!strcmp(slave->dev->name, &attr->attr.name[strlen(WEIGHT_FILE_INIT)])){
+        	pr_info("%s: Getting weight for slave %s: %d (%d)\n", bond->dev->name, slave->dev->name, slave->weight_init, slave->weight);
+            read_unlock(&bond->lock);
+            return sprintf(buf, "%d\n", slave->weight_init);
+        }
+    }
+    read_unlock(&bond->lock);
+
+    return sprintf(buf, "%d\n", -1);
+}
+
+
+static ssize_t bonding_store_weights(struct device *d, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int i;
+	struct slave *slave;
+	int new_value = 0, ret = count;
+	struct bonding *bond = to_bond(d);
+
+	if (sscanf(buf, "%d", &new_value) != 1) {
+			pr_err("%s: no weight value specified.\n",
+			       bond->dev->name);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (new_value < 1 || new_value > 99) {
+			pr_err("%s: Invalid weight value %d not in range 1-99; rejected.\n",
+			       bond->dev->name, new_value);
+			ret = -EINVAL;
+			goto out;
+		}
+
+
+		read_lock(&bond->lock);
+		        bond_for_each_slave(bond, slave, i) {
+		                pr_info("slave #%d: %s\n", i, slave->dev->name);
+		                if (!strcmp(slave->dev->name, &attr->attr.name[strlen(WEIGHT_FILE_INIT)])){
+		                	slave->weight_init = new_value;
+		                	slave->weight = 1000 / new_value;
+		                	pr_info("%s: Setting weight to %d (%d) for slave %s.\n", bond->dev->name, slave->weight_init, slave->weight, slave->dev->name);
+		                }
+		        }
+		read_unlock(&bond->lock);
+
+	out:
+		return ret;
+}
+
+void bond_create_weights(struct net_device *master, struct slave *slave)
+{
+	slave->dev_attr_weights.attr.name = slave->weight_filename;
+	slave->dev_attr_weights.attr.mode = S_IRUGO | S_IWUSR;
+	slave->dev_attr_weights.show = &bonding_show_weights;
+	slave->dev_attr_weights.store = &bonding_store_weights;
+
+	sysfs_create_file(&(master->dev.kobj), &slave->dev_attr_weights.attr);
+}
+
+void bond_destroy_weights(struct net_device *master, struct slave *slave)
+{
+	sysfs_remove_file(&(master->dev.kobj), &slave->dev_attr_weights.attr);
+}

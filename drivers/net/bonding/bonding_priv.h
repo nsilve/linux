@@ -18,6 +18,7 @@
 
 #define DRV_NAME	"bonding"
 #define DRV_DESCRIPTION	"Ethernet Channel Bonding Driver"
+#define WEIGHT_FILE_INIT "weight_"
 
 #define bond_version DRV_DESCRIPTION ": v" UTS_RELEASE "\n"
 

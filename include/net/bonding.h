@@ -175,6 +175,11 @@ struct slave {
 	u32    speed;
 	u16    queue_id;
 	u8     perm_hwaddr[MAX_ADDR_LEN];
+	u16    weight;
+	u16    weightcnt;
+	char   weight_filename[IFNAMSIZ + sizeof(WEIGHT_FILE_INIT)];
+    struct device_attribute dev_attr_weights;
+    u16    weight_init;
 	struct ad_slave_info *ad_info;
 	struct tlb_slave_info tlb_info;
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -637,6 +642,9 @@ void bond_debug_register(struct bonding *bond);
 void bond_debug_unregister(struct bonding *bond);
 void bond_debug_reregister(struct bonding *bond);
 const char *bond_mode_name(int mode);
+int bond_wa_getweight(char *devname, int *weight_init);
+void bond_create_weights(struct net_device *master, struct slave *slave);
+void bond_destroy_weights(struct net_device *master, struct slave *slave);
 void bond_setup(struct net_device *bond_dev);
 unsigned int bond_get_num_tx_queues(void);
 int bond_netlink_init(void);

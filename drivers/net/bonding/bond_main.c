@@ -114,6 +114,7 @@ static struct bond_params bonding_defaults;
 static int resend_igmp = BOND_DEFAULT_RESEND_IGMP;
 static int packets_per_slave = 1;
 static int lp_interval = BOND_ALB_DEFAULT_LP_INTERVAL;
+static char *weights;
 
 module_param(max_bonds, int, 0);
 MODULE_PARM_DESC(max_bonds, "Max number of bonded devices");
@@ -139,7 +140,9 @@ module_param(mode, charp, 0);
 MODULE_PARM_DESC(mode, "Mode of operation; 0 for balance-rr, "
 		       "1 for active-backup, 2 for balance-xor, "
 		       "3 for broadcast, 4 for 802.3ad, 5 for balance-tlb, "
-		       "6 for balance-alb");
+		       "6 for balance-alb, 7 for weighted-aggregate");
+module_param(weights, charp, 0);
+MODULE_PARM_DESC(weights, "Weights for weighted-aggregate mode in format: ifname(str):weight(uint<=65),ifname:weight");
 module_param(primary, charp, 0);
 MODULE_PARM_DESC(primary, "Primary network device to use");
 module_param(primary_reselect, charp, 0);
@@ -271,9 +274,10 @@ const char *bond_mode_name(int mode)
 		[BOND_MODE_8023AD] = "IEEE 802.3ad Dynamic link aggregation",
 		[BOND_MODE_TLB] = "transmit load balancing",
 		[BOND_MODE_ALB] = "adaptive load balancing",
+		[BOND_MODE_WEIGHTEDAGGR] = "weighted link aggregation",
 	};
 
-	if (mode < BOND_MODE_ROUNDROBIN || mode > BOND_MODE_ALB)
+	if (mode < BOND_MODE_ROUNDROBIN || mode > BOND_MODE_WEIGHTEDAGGR)
 		return "unknown";
 
 	return names[mode];
@@ -1754,6 +1758,12 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 	new_slave->delay = 0;
 	new_slave->link_failure_count = 0;
 
+	if (bond->params.mode == BOND_MODE_WEIGHTEDAGGR) {
+		new_slave->weight = bond_wa_getweight(new_slave->dev->name, (int*)&new_slave->weight_init);
+		new_slave->weightcnt = 0;
+		sprintf(new_slave->weight_filename, "%s%s", WEIGHT_FILE_INIT, new_slave->dev->name);
+	}
+
 	if (bond_update_speed_duplex(new_slave) &&
 	    bond_needs_speed_duplex(bond))
 		new_slave->link = BOND_LINK_DOWN;
@@ -1955,6 +1965,13 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 		   bond_is_active_slave(new_slave) ? "an active" : "a backup",
 		   new_slave->link != BOND_LINK_DOWN ? "an up" : "a down");
 
+	if (bond->params.mode == BOND_MODE_WEIGHTEDAGGR) {
+		pr_info("%s: %s has weight increment set to %d.\n",
+		bond_dev->name, slave_dev->name,
+		new_slave->weight);
+		bond_create_weights(bond_dev, new_slave);
+	}
+
 	/* enslave is successful */
 	bond_queue_slave_event(new_slave);
 	return 0;
@@ -1982,6 +1999,7 @@ err_detach:
 	/* either primary_slave or curr_active_slave might've changed */
 	synchronize_rcu();
 	slave_disable_netpoll(new_slave);
+	bond_destroy_weights(bond_dev, new_slave);
 
 err_close:
 	if (!netif_is_bond_master(slave_dev))
@@ -2023,6 +2041,47 @@ err_undo_flags:
 	}
 
 	return res;
+}
+
+int bond_wa_getweight(char *devname, int *weight_init)
+{
+	char *p;
+	char *abc = "1234567890";
+	char szam[3];
+	int i;
+	int init_weight;
+
+	if (strlen(weights) == 0) {
+	    *weight_init = 1;
+		return 1000;
+	}
+
+	p = strstr(weights, devname);
+	if (p == NULL) {
+	    *weight_init = 1;
+		return 1000;
+	}
+	p = p + strlen(devname) + 1;
+
+	i = strspn(p, abc);
+
+	if (i == 0){
+		*weight_init = 1;
+		return 1000;
+	}
+	if (i > 2){
+		*weight_init = 1;
+		return 1000;
+	}
+
+	strncpy(szam, p, i);
+	szam[i] = '\0';
+	init_weight = simple_strtoul(szam, NULL, 10);
+	i = 1000 / init_weight;
+
+	*weight_init = init_weight;
+
+	return i;
 }
 
 /* Try to release the slave device <slave> from the bond device <master>
@@ -2142,6 +2201,8 @@ static int __bond_release_one(struct net_device *bond_dev,
 		slave_info(bond_dev, slave_dev, "last VLAN challenged slave left bond - VLAN blocking is removed\n");
 
 	vlan_vids_del_by_dev(slave_dev, bond_dev);
+
+	bond_destroy_weights(bond_dev, slave);
 
 	/* If the mode uses primary, then this case was handled above by
 	 * bond_change_active_slave(..., NULL)
@@ -4199,6 +4260,67 @@ static netdev_tx_t bond_xmit_activebackup(struct sk_buff *skb,
 	return bond_tx_drop(bond_dev, skb);
 }
 
+static int bond_xmit_weightedaggr(struct sk_buff *skb, struct net_device *bond_dev)
+{
+	struct bonding *bond = netdev_priv(bond_dev);
+	struct slave *slave, *start_at;
+	int i, slave_no, res = 1;
+	struct iphdr *iph = ip_hdr(skb);
+
+	/*
+	 * Start with the curr_active_slave that joined the bond as the
+	 * default for sending IGMP traffic.  For failover purposes one
+	 * needs to maintain some consistency for the interface that will
+	 * send the join/membership reports.  The curr_active_slave found
+	 * will send all of this type of traffic.
+	 */
+	if ((iph->protocol == IPPROTO_IGMP) &&
+	    (skb->protocol == htons(ETH_P_IP))) {
+
+		read_lock(&bond->curr_slave_lock);
+		slave = bond->curr_active_slave;
+		read_unlock(&bond->curr_slave_lock);
+
+		if (!slave)
+			goto out;
+	} else {
+		slave_no = bond->rr_tx_counter % bond->slave_cnt;
+
+		bond_for_each_slave(bond, slave, i) {
+			slave_no--;
+			if (slave_no < 0)
+				break;
+		}
+	}
+
+	start_at = slave;
+	bond_for_each_slave_from(bond, slave, i, start_at) {
+		if (IS_UP(slave->dev) &&
+		    (slave->link == BOND_LINK_UP) &&
+		    bond_is_active_slave(slave)) {
+			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+
+			slave->weightcnt += slave->weight;
+			if (slave->next->weightcnt <= slave->weightcnt) {
+				bond->rr_tx_counter++;
+			}
+			if (slave->weightcnt > 1000) {
+				slave->weightcnt -= 1000;
+			}
+
+			break;
+		}
+	}
+
+out:
+	if (res) {
+		/* no suitable interface, frame not sent */
+		dev_kfree_skb(skb);
+	}
+
+	return NETDEV_TX_OK;
+}
+
 /* Use this to update slave_array when (a) it's not appropriate to update
  * slave_array right away (note that update_slave_array() may sleep)
  * and / or (b) RTNL is not held.
@@ -4540,6 +4662,8 @@ static netdev_tx_t __bond_start_xmit(struct sk_buff *skb, struct net_device *dev
 		return bond_alb_xmit(skb, dev);
 	case BOND_MODE_TLB:
 		return bond_tlb_xmit(skb, dev);
+	case BOND_MODE_WEIGHTEDAGGR:
+		return bond_xmit_weightedaggr(skb, dev);
 	default:
 		/* Should never happen, mode already checked */
 		netdev_err(dev, "Unknown bonding mode %d\n", BOND_MODE(bond));
